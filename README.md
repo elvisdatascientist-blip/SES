@@ -4,28 +4,70 @@
 **Region:** eu-west-2 (London)
 **Domain:** tiberbu.health
 **Daily Quota:** 50,000 emails / 24h rolling window
-**Incident Date:** 2026-09-15 — quota exceeded, cause unknown (no CloudTrail trail was configured)
+**Incident Date:** 2026-09-16 — quota exceeded, cause unknown (no CloudTrail trail configured at the time)
 
 ---
 
 ## Background
 
-We share one SES account across 53 IAM users (47 counties + 6 app users).
-All 53 share the **same 50,000/day quota** — any single sender can exhaust it for everyone.
+We share one SES account across 51 IAM users (47 county HMIS + 4 app users).
+All 51 share the **same 50,000/day quota** — any single sender can exhaust it for everyone.
 
-On 2026-09-15 we exceeded the quota. Because no CloudTrail trail existed at the time,
-we could not determine which user caused the spike. This runbook sets up:
+On 2026-09-16 we exceeded the quota and could not determine which sender caused the spike
+because no logging was in place. This runbook sets up per-sender visibility using:
 
-1. **CloudTrail** — so every SES API call is logged going forward
-2. **Configuration Sets + CloudWatch Log Groups** — per-sender visibility in near real-time
-3. **CloudWatch Alarms** — alert before we hit the limit again
+1. **A domain-level default Configuration Set** — no app code changes required, automatically covers all current and future senders
+2. **A CloudWatch Log Group** — 90 days retention, queryable with Logs Insights
+3. **A tighter IAM policy** — replaces `AmazonSESFullAccess` with send-only permissions
+4. **A CloudWatch Alarm** — alerts before quota is hit again
+
+> **Why no S3 / CloudTrail trail?**
+> CloudTrail Event History (free, built-in, no setup) already retains 90 days of API calls
+> and is queryable via the console. CloudWatch Logs also retains SES send events for 90 days.
+> An S3 trail is only needed if you require retention beyond 90 days or Athena SQL queries —
+> that can be added later if compliance requires it.
+
+---
+
+## Lessons Learned: What Went Wrong
+
+| Gap | Impact | Fix in this runbook |
+|---|---|---|
+| No logging on SES sends | Could not identify which sender caused spike | Config set → CloudWatch Logs |
+| `AmazonSESFullAccess` on all users | Users can delete identities, config sets, modify account settings | Replace with `TiberbuSESSenderPolicy` |
+| No quota alarm | Found out after exceeding the limit | CloudWatch Alarm at 80% |
+| No per-sender attribution | All 51 users look identical in SES metrics | Domain default config set + email tags |
+
+---
+
+## Architecture (No App Code Changes Required)
+
+```
+tiberbu.health (SES identity)
+  └── Default config set: cfgset-tiberbu-default   ← set once on the domain
+        └── Event destination → CloudWatch Log Group: /aws/ses/all-senders
+              └── 90-day retention
+              └── Queryable via Logs Insights (per-county, per-hour, bounces)
+
+IAM users (51 existing + any future users)
+  └── TiberbuSESSenderPolicy (send-only, no admin actions)
+        └── App sends email (no config set in the call)
+              → IAM: ALLOW
+              → SES injects domain default cfgset-tiberbu-default automatically
+              → Event logged to CloudWatch ✓
+              → Email delivers ✓
+```
+
+**Key point:** The domain default config set is injected by SES *after* IAM allows the call.
+Apps do not need any code changes. New counties or apps added in future are automatically
+covered the moment their IAM user is created and the domain default is in place.
 
 ---
 
 ## Step 1: Verify Current Quota Usage
 
-**What this does:** Checks how many emails have been sent in the last 24 hours
-against your daily limit. The window is rolling (not midnight-reset).
+**What this does:** Checks how many emails have been sent in the rolling 24-hour window.
+The window is not midnight-to-midnight — it is a sliding 24 hours.
 
 ```bash
 aws sesv2 get-account \
@@ -34,7 +76,7 @@ aws sesv2 get-account \
   --query 'SendQuota'
 ```
 
-**Expected output:**
+**Output explained:**
 ```json
 {
     "Max24HourSend": 50000.0,
@@ -43,25 +85,19 @@ aws sesv2 get-account \
 }
 ```
 
-- `Max24HourSend` — your ceiling
+- `Max24HourSend` — your hard ceiling
 - `SentLast24Hours` — emails sent in the last rolling 24 hours
-- `MaxSendRate` — max emails per second
+- `MaxSendRate` — max emails per second (exceeding this throttles, does not block)
 
 ---
 
 ## Step 2: Audit IAM Users with SES Access
 
-**What this does:** Lists all IAM users that have SES permissions attached,
-and what policy grants them access. This is how we identified all 53 senders.
+**What this does:** Lists all IAM users with SES permissions and confirms what policy
+grants them access.
 
 ```bash
-# List all IAM users
-aws iam list-users \
-  --profile mohcluster \
-  --output json \
-  --query 'Users[*].UserName'
-
-# Check policies for a specific user
+# Check policies on any specific user
 aws iam list-attached-user-policies \
   --profile mohcluster \
   --user-name hmis-nairobi-SES
@@ -71,11 +107,11 @@ aws iam list-user-policies \
   --user-name hmis-nairobi-SES
 ```
 
-### Findings: SES IAM Users (53 total)
+### Findings: Active SES Senders (51 users)
 
 **Category 1: HMIS per-county (47 users)**
 
-All have `AmazonSESFullAccess` managed policy attached.
+All currently have `AmazonSESFullAccess`. Will be replaced with `TiberbuSESSenderPolicy` in Step 6.
 
 | IAM User | County | Notes |
 |---|---|---|
@@ -97,7 +133,7 @@ All have `AmazonSESFullAccess` managed policy attached.
 | hmis-kitui-SES | Kitui | |
 | hmis-kwale-SES | Kwale | |
 | hmis-laikipia-SES | Laikipia | |
-| hmis-lamu-SES | Lamu | |
+| hmis-lamu-SES | Lamu | Pilot user for policy rollout |
 | hmis-machakos-SES | Machakos | |
 | hmis-makueni-SES | Makueni | |
 | hmis-mandera-SES | Mandera | |
@@ -120,12 +156,12 @@ All have `AmazonSESFullAccess` managed policy attached.
 | hmis-transnzoia-SES | Trans Nzoia | |
 | hmis-turkana-SES | Turkana | |
 | hmis-uasin-gishu-SES | Uasin Gishu | |
-| hmis-uat-SES | UAT environment | Has extra inline policy: `DenyOutsideClusterIP` |
+| hmis-uat-SES | UAT environment | Has extra inline policy `DenyOutsideClusterIP` — keep it |
 | hmis-vihiga-SES | Vihiga | |
 | hmis-wajir-SES | Wajir | |
 | hmis-west-pokot-SES | West Pokot | |
 
-**Category 2: App/Service users (6 users)**
+**Category 2: App/Service users (4 active SES users)**
 
 | IAM User | App | Policy |
 |---|---|---|
@@ -134,239 +170,279 @@ All have `AmazonSESFullAccess` managed policy attached.
 | compliance360-SES | Compliance360 | AmazonSESFullAccess |
 | ses-smtp | Generic SMTP sender | AmazonSESFullAccess |
 | simple-email-service | Generic SES sender | AmazonSESFullAccess |
-| SHRAPPPROD | SHRAPP (prod) | AmazonHealthLakeFullAccess (NOT SES) |
-| SHRAPPUAT | SHRAPP (UAT) | AmazonHealthLakeFullAccess (NOT SES) |
 
-> **Note:** `SHRAPPPROD` and `SHRAPPUAT` do NOT have SES permissions — they are HealthLake users,
-> not email senders. They can be removed from the SES investigation.
-
-**Effective SES senders: 51 users** (47 county HMIS + 4 app users)
+> **Not SES users:** `SHRAPPPROD` and `SHRAPPUAT` only have `AmazonHealthLakeFullAccess` —
+> they are not email senders and are excluded from this runbook.
 
 ---
 
-## Step 3: Set Up CloudTrail (One-Time)
+## Step 3: Create the CloudWatch Log Group
 
-**Why:** Without a CloudTrail trail, AWS only keeps 90 days of limited event history
-and you cannot query who sent what. A trail writes every API call to S3 permanently.
-
-**What this does — broken down:**
-
-```bash
-# 3a. Create an S3 bucket to store the logs
-# Replace <unique-suffix> with something like your account ID or date
-aws s3api create-bucket \
-  --profile mohcluster \
-  --bucket tiberbu-cloudtrail-logs-024848484634 \
-  --region eu-west-2 \
-  --create-bucket-configuration LocationConstraint=eu-west-2
-```
-> This creates a private S3 bucket. CloudTrail will write compressed JSON logs here.
-> Each log file = all API calls in a 5-minute window.
+**What this does:** Creates a single log group that will receive every SES send event
+(sent, delivered, bounced, complained) from all senders. 90-day retention keeps storage
+costs low while giving a full audit window.
 
 ```bash
-# 3b. Create the trail (multi-region = captures ALL regions, not just London)
-aws cloudtrail create-trail \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --name tiberbu-main-trail \
-  --s3-bucket-name tiberbu-cloudtrail-logs-024848484634 \
-  --is-multi-region-trail \
-  --include-global-service-events
-```
-> `--is-multi-region-trail` — catches calls made to SES even if someone accidentally
-> targets a different region.
-> `--include-global-service-events` — captures IAM events too (useful for security audits).
-
-```bash
-# 3c. Start logging (trail is created paused by default)
-aws cloudtrail start-logging \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --name tiberbu-main-trail
-```
-
-```bash
-# 3d. Verify it is running
-aws cloudtrail get-trail-status \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --name tiberbu-main-trail \
-  --query '{IsLogging:IsLogging, LatestDelivery:LatestDeliveryTime}'
-```
-> `IsLogging` should be `true`. `LatestDeliveryTime` will populate after the first
-> 5-minute window passes.
-
----
-
-## Step 4: Create CloudWatch Log Groups
-
-**Why:** We create two log groups — one for all HMIS counties, one for non-HMIS apps.
-This keeps logs organized and lets you query "how many emails did Nairobi county send
-in the last hour?" using CloudWatch Logs Insights.
-
-```bash
-# For all HMIS county senders
+# Create the log group
 aws logs create-log-group \
   --profile mohcluster \
   --region eu-west-2 \
-  --log-group-name /aws/ses/hmis-counties
+  --log-group-name /aws/ses/all-senders
 
-# For app/service senders (client-registry, compliance360, etc.)
-aws logs create-log-group \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --log-group-name /aws/ses/apps
-
-# Set retention to 90 days (so logs don't grow forever)
+# Set 90-day retention
 aws logs put-retention-policy \
   --profile mohcluster \
   --region eu-west-2 \
-  --log-group-name /aws/ses/hmis-counties \
+  --log-group-name /aws/ses/all-senders \
   --retention-in-days 90
+```
 
-aws logs put-retention-policy \
+**Verify it was created:**
+```bash
+aws logs describe-log-groups \
   --profile mohcluster \
   --region eu-west-2 \
-  --log-group-name /aws/ses/apps \
-  --retention-in-days 90
+  --log-group-name-prefix /aws/ses \
+  --query 'logGroups[*].{Name:logGroupName, RetentionDays:retentionInDays}'
 ```
 
 ---
 
-## Step 5: Create Configuration Sets
+## Step 4: Create the Configuration Set and Wire to Log Group
 
 **What is a Configuration Set?**
-A named tag you attach to SES API calls. SES uses it to route event data
-(sent, bounced, delivered, complained) to a destination like CloudWatch Logs.
-
-Without a config set, SES sends the email but records nothing per-sender.
-With a config set, every send event is written to your log group with the sender tag.
+A named object in SES that routes email events to a destination (in our case, CloudWatch Logs).
+When attached as a domain default, SES automatically applies it to every email sent through
+`tiberbu.health` — even if the app passes nothing.
 
 ```bash
-# Config set for all HMIS county instances
+# 4a. Create the config set
 aws sesv2 create-configuration-set \
   --profile mohcluster \
   --region eu-west-2 \
-  --configuration-set-name cfgset-hmis-counties
-
-# Config set for client-registry
-aws sesv2 create-configuration-set \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --configuration-set-name cfgset-client-registry
-
-# Config set for compliance360
-aws sesv2 create-configuration-set \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --configuration-set-name cfgset-compliance360
-
-# Config set for ses-smtp / simple-email-service (generic senders)
-aws sesv2 create-configuration-set \
-  --profile mohcluster \
-  --region eu-west-2 \
-  --configuration-set-name cfgset-generic-smtp
+  --configuration-set-name cfgset-tiberbu-default
 ```
 
----
-
-## Step 6: Wire Configuration Sets to Log Groups
-
-**What this does:** Tells each config set to write all email events
-(Send, Bounce, Complaint, Delivery) into the appropriate CloudWatch Log Group.
-
 ```bash
-# HMIS counties → /aws/ses/hmis-counties
+# 4b. Wire it to the CloudWatch log group
 aws sesv2 create-configuration-set-event-destination \
   --profile mohcluster \
   --region eu-west-2 \
-  --configuration-set-name cfgset-hmis-counties \
-  --event-destination-name logs-dest \
+  --configuration-set-name cfgset-tiberbu-default \
+  --event-destination-name cw-logs-dest \
   --event-destination '{
     "Enabled": true,
-    "MatchingEventTypes": ["SEND","BOUNCE","COMPLAINT","DELIVERY","REJECT"],
+    "MatchingEventTypes": ["SEND","DELIVERY","BOUNCE","COMPLAINT","REJECT"],
     "CloudWatchLogsDestination": {
-      "LogGroupArn": "arn:aws:logs:eu-west-2:024848484634:log-group:/aws/ses/hmis-counties"
+      "LogGroupArn": "arn:aws:logs:eu-west-2:024848484634:log-group:/aws/ses/all-senders"
     }
   }'
+```
 
-# Apps → /aws/ses/apps
-aws sesv2 create-configuration-set-event-destination \
+```bash
+# 4c. Attach it as the domain default — ONE command that covers all 51 senders
+aws sesv2 put-email-identity-configuration-set-attributes \
   --profile mohcluster \
   --region eu-west-2 \
-  --configuration-set-name cfgset-client-registry \
-  --event-destination-name logs-dest \
-  --event-destination '{
-    "Enabled": true,
-    "MatchingEventTypes": ["SEND","BOUNCE","COMPLAINT","DELIVERY","REJECT"],
-    "CloudWatchLogsDestination": {
-      "LogGroupArn": "arn:aws:logs:eu-west-2:024848484634:log-group:/aws/ses/apps"
+  --email-identity tiberbu.health \
+  --configuration-set-name cfgset-tiberbu-default
+```
+
+**Verify the domain default was applied:**
+```bash
+aws sesv2 get-email-identity \
+  --profile mohcluster \
+  --region eu-west-2 \
+  --email-identity tiberbu.health \
+  --query 'ConfigurationSetName'
+```
+Expected output: `"cfgset-tiberbu-default"`
+
+---
+
+## Step 5: Test the Pipeline End-to-End
+
+**What this does:** Sends a real test email using your admin credentials (not any IAM user),
+then verifies the event landed in CloudWatch. No IAM user is touched.
+
+```bash
+# 5a. Send a test email — replace the To address with your own
+aws sesv2 send-email \
+  --profile mohcluster \
+  --region eu-west-2 \
+  --from-email-address noreply@tiberbu.health \
+  --destination '{"ToAddresses": ["elvis@tiberbu.com"]}' \
+  --content '{
+    "Simple": {
+      "Subject": {"Data": "SES Config Set Test - ignore"},
+      "Body": {"Text": {"Data": "Validating CloudWatch logging pipeline. Safe to ignore."}}
     }
-  }'
-
-# Repeat for cfgset-compliance360 and cfgset-generic-smtp
-# (same command, change --configuration-set-name)
+  }' \
+  --configuration-set-name cfgset-tiberbu-default
 ```
+
+```bash
+# 5b. Wait ~60 seconds, then check for a log stream
+aws logs describe-log-streams \
+  --profile mohcluster \
+  --region eu-west-2 \
+  --log-group-name /aws/ses/all-senders \
+  --order-by LastEventTime \
+  --descending \
+  --limit 3 \
+  --query 'logStreams[*].{Stream:logStreamName, LastEvent:lastEventTimestamp}'
+```
+
+```bash
+# 5c. Read the actual log event — copy the stream name from the output above
+aws logs get-log-events \
+  --profile mohcluster \
+  --region eu-west-2 \
+  --log-group-name /aws/ses/all-senders \
+  --log-stream-name <stream-name-from-5b> \
+  --query 'events[*].message' \
+  --output text | python3 -m json.tool
+```
+
+**A passing test looks like this:**
+```json
+{
+  "eventType": "Send",
+  "mail": {
+    "timestamp": "2026-09-17T10:23:00Z",
+    "source": "noreply@tiberbu.health",
+    "destination": ["elvis@tiberbu.com"],
+    "sendingAccountId": "024848484634"
+  }
+}
+```
+
+**What this confirms:**
+- Step 5a succeeds → config set is valid
+- Step 5b shows a stream → SES wrote to CloudWatch (pipeline works end-to-end)
+- Step 5c shows the event → log content is readable and queryable
+- You also receive the email → sending itself is not broken
 
 ---
 
-## Step 7: Update App Code to Use Configuration Sets
+## Step 6: Replace AmazonSESFullAccess with TiberbuSESSenderPolicy
 
-**This is the most important step.** Until apps pass the config set name in
-their SES API call, none of the above logging takes effect.
+**Why:** `AmazonSESFullAccess` gives apps the ability to delete identities, modify account
+sending limits, and delete configuration sets — far more than a sending app needs.
+`TiberbuSESSenderPolicy` restricts to send-only actions.
 
-### How SES knows which config set to use
+> **Note:** `ses:ConfigurationSet` is NOT a valid IAM condition key for the SES service.
+> Enforcement is handled at the SES layer via the domain default, not the IAM layer.
 
-The app must include `ConfigurationSetName` in the API call. Example:
+```bash
+# 6a. Save the policy document
+cat > /home/elvis/ses-quota-visibility/ses-sender-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowSESSendOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ses:SendEmail",
+        "ses:SendRawEmail",
+        "ses:SendBulkEmail",
+        "ses:SendTemplatedEmail",
+        "ses:SendBounce"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
 
-**Python (boto3):**
-```python
-ses.send_email(
-    Source='noreply@tiberbu.health',
-    Destination={'ToAddresses': ['user@example.com']},
-    Message={...},
-    ConfigurationSetName='cfgset-hmis-counties',   # <-- this line
-    Tags=[{'Name': 'County', 'Value': 'nairobi'}]  # optional: per-county tag
-)
+# 6b. Create it as a reusable managed policy in AWS
+aws iam create-policy \
+  --profile mohcluster \
+  --policy-name TiberbuSESSenderPolicy \
+  --policy-document file:///home/elvis/ses-quota-visibility/ses-sender-policy.json \
+  --description "Send-only SES access. Admin actions (delete identity, modify limits) are excluded."
 ```
 
-**SMTP (e.g. Frappe/ERPNext):**
-Add this header to every outgoing email:
-```
-X-SES-CONFIGURATION-SET: cfgset-hmis-counties
-```
-In Frappe, this is set in: `Site Config → email_account → ses_configuration_set`
+### Rollout: pilot one county first
 
-### County-level tagging (recommended)
+Do not replace all 51 users at once. Start with Lamu (smallest county, lowest volume):
 
-Since all 47 counties share one config set (`cfgset-hmis-counties`), add an
-email tag so you can filter by county in CloudWatch Logs Insights:
+```bash
+# Detach the old broad policy
+aws iam detach-user-policy \
+  --profile mohcluster \
+  --user-name hmis-lamu-SES \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSESFullAccess
 
-```python
-Tags=[{'Name': 'County', 'Value': 'nairobi'}]
+# Attach the new send-only policy
+aws iam attach-user-policy \
+  --profile mohcluster \
+  --user-name hmis-lamu-SES \
+  --policy-arn arn:aws:iam::024848484634:policy/TiberbuSESSenderPolicy
 ```
 
-Or via SMTP header:
+Monitor for 24 hours. If no complaints from Lamu HMIS → roll out to remaining users.
+
+### Rollout: all remaining users (run after pilot confirmed)
+
+```bash
+# Run this only after the pilot is confirmed working
+for USER in \
+  hmis-baringo-SES hmis-bomet-SES hmis-bungoma-SES hmis-busia-SES \
+  hmis-elgeyo-marakwet-SES hmis-embu-SES hmis-garissa-SES hmis-isiolo-SES \
+  hmis-kajiado-SES hmis-kakamega-SES hmis-kericho-SES hmis-kiambu-SES \
+  hmis-kirinyaga-SES hmis-kisii-SES hmis-kisumu-SES hmis-kitui-SES \
+  hmis-kwale-SES hmis-laikipia-SES hmis-machakos-SES hmis-makueni-SES \
+  hmis-mandera-SES hmis-marsabit-SES hmis-meru-SES hmis-migori-SES \
+  hmis-mombasa-SES hmis-muranga-SES hmis-nairobi-SES hmis-nakuru-SES \
+  hmis-nandi-SES hmis-narok-SES hmis-nyamira-SES hmis-nyandarua-SES \
+  hmis-nyeri-SES hmis-samburu-SES hmis-taita-taveta-SES hmis-tana-river-SES \
+  hmis-tharaka-nithi-SES hmis-transnzoia-SES hmis-turkana-SES hmis-uasin-gishu-SES \
+  hmis-uat-SES hmis-vihiga-SES hmis-wajir-SES hmis-west-pokot-SES \
+  client-registry-SES client-registry-uat-SES compliance360-SES \
+  ses-smtp simple-email-service; do
+    echo "Updating $USER..."
+    aws iam detach-user-policy \
+      --profile mohcluster \
+      --user-name "$USER" \
+      --policy-arn arn:aws:iam::aws:policy/AmazonSESFullAccess
+    aws iam attach-user-policy \
+      --profile mohcluster \
+      --user-name "$USER" \
+      --policy-arn arn:aws:iam::024848484634:policy/TiberbuSESSenderPolicy
+done
+echo "Done."
 ```
-X-SES-MESSAGE-TAGS: County=nairobi
+
+### Adding a new SES user in future (two commands)
+
+```bash
+aws iam create-user --profile mohcluster --user-name hmis-<county>-SES
+
+aws iam attach-user-policy \
+  --profile mohcluster \
+  --user-name hmis-<county>-SES \
+  --policy-arn arn:aws:iam::024848484634:policy/TiberbuSESSenderPolicy
 ```
+
+The domain default config set covers them automatically — no other setup needed.
 
 ---
 
-## Step 8: CloudWatch Logs Insights Queries
+## Step 7: CloudWatch Logs Insights Queries
 
-Once logs are flowing, use these queries in the CloudWatch console
-(**CloudWatch → Logs → Logs Insights**, select the log group).
+Once logs are flowing, run these in the AWS Console:
+**CloudWatch → Logs → Logs Insights → select `/aws/ses/all-senders`**
 
-**Total sends per county (last 24h):**
+**Total sends in last 24 hours:**
 ```
-fields @timestamp, mail.tags.County.0, eventType
+fields @timestamp, eventType
 | filter eventType = "Send"
-| stats count() as TotalSent by mail.tags.County.0
-| sort TotalSent desc
+| stats count() as TotalSent
 ```
 
-**Hourly send rate (spot the spike):**
+**Hourly send volume — find the spike:**
 ```
 fields @timestamp, eventType
 | filter eventType = "Send"
@@ -374,35 +450,47 @@ fields @timestamp, eventType
 | sort @timestamp asc
 ```
 
-**Bounces and complaints by sender:**
+**Sends by source address:**
 ```
-fields @timestamp, mail.tags.County.0, eventType
+fields @timestamp, mail.source, eventType
+| filter eventType = "Send"
+| stats count() as TotalSent by mail.source
+| sort TotalSent desc
+```
+
+**Bounces and complaints (deliverability health):**
+```
+fields @timestamp, mail.source, eventType
 | filter eventType in ["Bounce", "Complaint"]
-| stats count() as Issues by mail.tags.County.0, eventType
+| stats count() as Issues by mail.source, eventType
 | sort Issues desc
 ```
 
 ---
 
-## Step 9: CloudWatch Alarm — Alert Before Quota Is Hit
+## Step 8: CloudWatch Alarm — Alert at 80% Quota
 
-**What this does:** Sends an SNS alert when SES sends exceed 40,000 in 24h
-(80% of quota) — giving you time to investigate before hitting the ceiling.
+**What this does:** SES does not publish a native CloudWatch metric for `SentLast24Hours`.
+The cleanest solution is a small Lambda that runs every 30 minutes, calls `sesv2 get-account`,
+and publishes a custom metric — then we alarm on that metric.
 
-> Note: SES does not publish a native "SentLast24Hours" CloudWatch metric.
-> The alarm below triggers on the per-minute send rate sustained over time.
-> For a more direct approach, a Lambda that calls `sesv2 get-account` on a
-> schedule and publishes a custom metric is the cleanest solution — we can
-> add that as a follow-up step.
-
+**Interim option (manual check command):**
 ```bash
-# Create SNS topic for alerts
+aws sesv2 get-account \
+  --profile mohcluster \
+  --region eu-west-2 \
+  --query 'SendQuota.{Sent:SentLast24Hours, Max:Max24HourSend}'
+```
+
+**SNS topic for alerts (create now, Lambda integration added as follow-up):**
+```bash
+# Create the alert topic
 aws sns create-topic \
   --profile mohcluster \
   --region eu-west-2 \
   --name ses-quota-alerts
 
-# Subscribe your email to the topic (replace with your address)
+# Subscribe the platform team email
 aws sns subscribe \
   --profile mohcluster \
   --region eu-west-2 \
@@ -411,17 +499,19 @@ aws sns subscribe \
   --notification-endpoint devops@tiberbu.com
 ```
 
+> Lambda-based quota alarm is tracked as a follow-up item.
+
 ---
 
-## Summary: What Each Piece Does
+## Summary: What Each Component Does
 
-| Component | What It Does | When It Helps |
+| Component | What It Does | Covers Future Users? |
 |---|---|---|
-| **CloudTrail trail** | Records every AWS API call (including `ses:SendEmail`) to S3 | Post-incident forensics, audit |
-| **CloudWatch Log Groups** | Stores structured SES event data (sent/bounce/complaint) | Real-time queries via Logs Insights |
-| **Configuration Sets** | Tags email traffic so SES knows which log group to write to | Links sends to a named sender |
-| **Email Tags (County=X)** | Further breaks down HMIS county traffic within one config set | County-level attribution |
-| **CloudWatch Alarm** | Alerts at 80% quota usage | Prevents repeat of the incident |
+| Domain default config set | Auto-tags all sends through tiberbu.health | Yes — automatic |
+| CloudWatch Log Group | 90-day store of every send/bounce/complaint event | Yes — automatic |
+| Logs Insights queries | Break down sends by source, time, event type | Yes |
+| TiberbuSESSenderPolicy | Restricts users to send-only actions | Yes — attach on creation |
+| CloudWatch Alarm | Alerts at 80% quota before hitting ceiling | Yes |
 
 ---
 
@@ -431,11 +521,12 @@ aws sns subscribe \
 |---|---|---|
 | Quota audit | Done | 17,154 / 50,000 as of 2026-09-16 |
 | IAM user audit | Done | 51 active SES senders identified |
-| CloudTrail trail | Pending | |
-| CloudWatch Log Groups | Pending | |
-| Configuration Sets | Pending | |
-| App code updates | Pending | Need to coordinate with county HMIS teams |
-| CloudWatch Alarm | Pending | |
+| CloudWatch Log Group | Pending | Step 3 |
+| Configuration Set + domain default | Pending | Step 4 |
+| Pipeline test | Pending | Step 5 — validate before touching IAM |
+| TiberbuSESSenderPolicy — pilot (Lamu) | Pending | Step 6 |
+| TiberbuSESSenderPolicy — full rollout | Pending | Step 6 — after pilot confirmed |
+| CloudWatch Alarm | Pending | Step 8 — Lambda follow-up |
 
 ---
 
@@ -446,9 +537,10 @@ aws sns subscribe \
 | hmis-{county}-SES (47 users) | County HMIS teams / MOH |
 | client-registry-SES | Client Registry team |
 | compliance360-SES | Compliance360 team |
-| ses-smtp / simple-email-service | Platform team (generic) |
+| ses-smtp / simple-email-service | Platform team |
 
 ---
 
 *Document created: 2026-09-16*
+*Last updated: 2026-09-17*
 *Author: Platform/Security Engineering — Elvis*
